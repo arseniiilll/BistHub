@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 import logging
 
+import stripe
 from rest_framework import mixins, viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.conf import settings
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404, redirect
 
 from .models import Payment
@@ -14,6 +15,7 @@ from .serializers import PaymentSerializer, PaymentCreateSerializer
 from .services import PaymentService, WebhookService
 
 logger = logging.getLogger(__name__)
+stripe.api_key = settings.STRIPE_SECRET_KEY
 
 
 class PaymentViewSet(mixins.ListModelMixin,
@@ -36,11 +38,61 @@ class PaymentViewSet(mixins.ListModelMixin,
 
     @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def success(self, request, pk=None):
-        """Return the browser to a dedicated React payment-success page."""
+        """
+        Stripe возвращает браузер сюда после успешного Checkout.
+
+        Webhook остаётся главным источником истины, но для UX мы дополнительно
+        синхронизируем Stripe Checkout Session прямо здесь. Поэтому к моменту
+        redirect на React заказ уже не остаётся визуально в PENDING, даже если
+        webhook пришёл на долю секунды позже.
+        """
         payment = get_object_or_404(
-            Payment.objects.select_related('order').only('id', 'order_id'),
+            Payment.objects.select_related('order'),
             pk=pk,
         )
+
+        if payment.stripe_session_id:
+            try:
+                session = stripe.checkout.Session.retrieve(payment.stripe_session_id)
+                session_status = getattr(session, 'status', None)
+                payment_status = getattr(session, 'payment_status', None)
+
+                if session_status == 'complete' and payment_status == 'paid':
+                    with transaction.atomic():
+                        locked_payment = (
+                            Payment.objects
+                            .select_for_update()
+                            .select_related('order')
+                            .get(pk=payment.pk)
+                        )
+
+                        if locked_payment.status not in (
+                            Payment.Status.SUCCEEDED,
+                            Payment.Status.PARTIALLY_REFUNDED,
+                            Payment.Status.REFUNDED,
+                        ):
+                            payment_intent_id = getattr(session, 'payment_intent', None)
+                            if payment_intent_id and not locked_payment.stripe_payment_intent_id:
+                                locked_payment.stripe_payment_intent_id = payment_intent_id
+                            locked_payment.mark_as_succeeded()
+
+                        order = (
+                            locked_payment.order.__class__.objects
+                            .select_for_update()
+                            .get(pk=locked_payment.order_id)
+                        )
+                        if order.status == order.StatusChoices.PENDING:
+                            order.status = order.StatusChoices.PROCESSING
+                            order.save(update_fields=['status', 'updated'])
+
+            except stripe.error.StripeError:
+                # Не ломаем redirect пользователю, если Stripe API временно
+                # недоступен: webhook всё равно остаётся резервным механизмом.
+                logger.exception(
+                    'Could not synchronise Stripe session for payment %s on success redirect',
+                    payment.id,
+                )
+
         frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
         return redirect(
             f'{frontend_url}/payment/success?payment_id={payment.id}&order_id={payment.order_id}'
