@@ -52,7 +52,7 @@ export const api = {
   order: id => request(`/orders/${id}/`),
   createOrder: body => request('/orders/', {method:'POST', body:JSON.stringify(body)}),
   payments: () => request('/payments/'),
-  createPayment: (order_id, payment_method='card') => request('/payments/', {method:'POST', body:JSON.stringify({order_id,payment_method})}),
+  createPayment: (order_id, payment_method='stripe') => request('/payments/', {method:'POST', body:JSON.stringify({order_id,payment_method})}),
   createReview: body => request('/reviews/', {method:'POST', body:JSON.stringify(body)}),
   deleteReview: id => request(`/reviews/${id}/`, {method:'DELETE'})
 }
