@@ -51,6 +51,8 @@ export const api = {
   orders: () => request('/orders/'),
   order: id => request(`/orders/${id}/`),
   createOrder: body => request('/orders/', {method:'POST', body:JSON.stringify(body)}),
+  deleteOrder: id => request(`/orders/${id}/`, {method:'DELETE'}),
+  bulkDeleteOrders: ids => request('/orders/bulk-delete/', {method:'POST', body:JSON.stringify({ids})}),
   payments: () => request('/payments/'),
   createPayment: (order_id, payment_method='stripe') => request('/payments/', {method:'POST', body:JSON.stringify({order_id,payment_method})}),
   createReview: body => request('/reviews/', {method:'POST', body:JSON.stringify(body)}),
