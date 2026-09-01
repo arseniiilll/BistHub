@@ -37,23 +37,19 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
         if order.user != request.user:
             raise serializers.ValidationError('Это не ваш заказ.')
 
-        valid_statuses = [
-            getattr(getattr(order, 'StatusChoices', object), 'PENDING', 'pending')
-        ]
-        if hasattr(order, 'status') and order.status not in valid_statuses:
-            raise serializers.ValidationError(
-                'Заказ не может быть оплачен в текущем состоянии.'
-            )
+        # Не блокируем оплату только по Order.status здесь. У старых заказов
+        # статус мог рассинхронизироваться с Payment/Stripe, а PaymentService
+        # умеет безопасно проверить реальную Stripe Checkout Session:
+        # - вернуть URL существующей open-сессии;
+        # - синхронизировать уже оплаченный заказ;
+        # - закрыть expired/cancelled сессию и создать новую.
+        # Финальные бизнес-проверки выполняются там под select_for_update().
 
         if order.payments.filter(
             status__in=['succeeded', 'partially_refunded', 'refunded']
         ).exists():
             raise serializers.ValidationError('Заказ уже оплачен.')
 
-        # Активный pending/processing платёж больше НЕ считаем ошибкой здесь.
-        # PaymentService сам безопасно решит, можно ли переиспользовать
-        # существующую Stripe Checkout Session, истекла ли она, либо нужно
-        # создать новый Payment.
         return attrs
 
     def create(self, validated_data):
