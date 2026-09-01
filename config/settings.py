@@ -36,6 +36,7 @@ ALLOWED_HOSTS = env_list(
     'ALLOWED_HOSTS',
     ('localhost', '127.0.0.1'),
 )
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173').rstrip('/')
 
 DJANGO_APPS = [
     'django.contrib.admin',
