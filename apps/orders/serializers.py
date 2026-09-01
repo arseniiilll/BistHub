@@ -8,18 +8,13 @@ from apps.main.models import Tobacco
 class OrderItemSerializer(serializers.ModelSerializer):
     # product_name — снимок имени на момент покупки. Показываем его, а если он
     # почему-то пуст (например, запись создана через bulk_create(), который
-    # обходит OrderItem.save() и не проставляет product_name) — подстраховываемся
-    # живым tobacco.name, чтобы не отдавать в API пустое имя товара.
+    # обходит OrderItem.save()) — подстраховываемся живым tobacco.name.
     tobacco_name = serializers.SerializerMethodField()
     total_price = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
         fields = ['id', 'tobacco', 'tobacco_name', 'quantity', 'price', 'total_price']
-        # Позиции заказа фиксируют факт покупки и не должны редактироваться
-        # постфактум (см. комментарий в admin.py) — поэтому tobacco и quantity
-        # тоже read-only, а не полагаемся на то, что сериализатор сейчас
-        # используется только с read_only=True снаружи.
         read_only_fields = ['id', 'tobacco', 'quantity', 'price', 'total_price']
 
     def get_tobacco_name(self, obj):
@@ -57,20 +52,18 @@ class OrderCreateSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
-        # Быстрый предварительный чек без блокировки — чтобы сразу отбить
-        # пустую корзину / несовершеннолетнего пользователя без похода в create().
-        # Финальная, атомарная проверка остатков — внутри create(), под select_for_update.
         request = self.context['request']
         user = request.user
 
         cart = Cart.objects.filter(user=user).first()
-        if not cart or not cart.items.exists():
+        if not cart:
             raise serializers.ValidationError('Корзина пуста.')
 
         cart_items = list(cart.items.select_related('product'))
+        if not cart_items:
+            raise serializers.ValidationError('Корзина пуста.')
 
-        requires_age_check = any(item.product.requires_age_verification for item in cart_items)
-        if requires_age_check and not user.is_of_legal_age:
+        if any(item.product.requires_age_verification for item in cart_items) and not user.is_of_legal_age:
             raise serializers.ValidationError(
                 'Для покупки этого товара нужно подтвердить дату рождения '
                 'и возраст 18+ в профиле аккаунта.'
@@ -87,42 +80,36 @@ class OrderCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         request = self.context['request']
 
-        # Блокируем саму корзину, чтобы два параллельных "оформить заказ"
-        # по одной и той же корзине не создали два заказа из одних позиций.
-        # Используем filter().first() вместо .get(): если у пользователя почему-то
-        # окажется больше одной корзины, .get() бросил бы необработанный
-        # MultipleObjectsReturned (500) вместо аккуратной бизнес-ошибки.
         cart = Cart.objects.select_for_update().filter(user=request.user).order_by('pk').first()
         if not cart:
-            # Между мягкой проверкой в validate() и захватом лока здесь
-            # корзина могла исчезнуть (гонка/повторный сабмит) — это та же
-            # бизнес-ошибка "корзина пуста", а не повод отдавать 500.
             raise serializers.ValidationError('Корзина пуста.')
-        cart_items = list(cart.items.select_related('product'))
 
+        cart_items = list(cart.items.select_related('product'))
         if not cart_items:
             raise serializers.ValidationError('Корзина пуста.')
 
-        # Блокируем товары в фиксированном порядке (по pk) — важно, чтобы
-        # избежать deadlock, если два заказа одновременно берут разные
-        # наборы одних и тех же товаров в разном порядке.
+        # Блокируем товары в стабильном порядке, чтобы параллельные checkout
+        # не могли продать один и тот же остаток дважды и реже ловили deadlock.
         product_ids = sorted({item.product_id for item in cart_items})
         locked_products = {
-            p.pk: p
-            for p in Tobacco.objects.select_for_update().filter(pk__in=product_ids).order_by('pk')
+            product.pk: product
+            for product in Tobacco.objects.select_for_update()
+            .filter(pk__in=product_ids)
+            .order_by('pk')
         }
 
+        # Теоретически товар мог быть удалён между чтением корзины и локом.
+        missing_ids = set(product_ids) - set(locked_products)
+        if missing_ids:
+            raise serializers.ValidationError('Один из товаров больше недоступен.')
+
         order = Order.objects.create(user=request.user, total_price=0, **validated_data)
+        order_items = []
+        products_to_update = []
 
         for cart_item in cart_items:
             product = locked_products[cart_item.product_id]
 
-            # Повторяем проверки возраста и доступности здесь, на свежих,
-            # заблокированных под select_for_update() объектах — а не
-            # полагаемся на то, что было в корзине на момент validate().
-            # Между validate() и захватом лока в create() параллельный
-            # запрос мог добавить в корзину табачный товар (возраст ещё
-            # не перепроверен) или товар успели снять с продажи.
             if product.requires_age_verification and not request.user.is_of_legal_age:
                 raise serializers.ValidationError(
                     'Для покупки этого товара нужно подтвердить дату рождения '
@@ -130,23 +117,30 @@ class OrderCreateSerializer(serializers.ModelSerializer):
                 )
             if not product.is_available:
                 raise serializers.ValidationError(f'Товар "{product.name}" больше не доступен для заказа.')
-            if cart_item.quantity > product.stock_quantity:
-                raise serializers.ValidationError(f'Недостаточно "{product.name}" на складе.')
-            # OrderItem.quantity объявлен с MinValueValidator(1), но .create()/.save()
-            # не вызывают full_clean(), так что валидатор модели сам по себе не
-            # защищает от quantity <= 0 — проверяем явно здесь, на реальном пути записи.
             if cart_item.quantity < 1:
                 raise serializers.ValidationError(f'Некорректное количество для "{product.name}".')
+            if cart_item.quantity > product.stock_quantity:
+                raise serializers.ValidationError(f'Недостаточно "{product.name}" на складе.')
 
-            OrderItem.objects.create(
+            order_items.append(OrderItem(
                 order=order,
                 tobacco=product,
+                product_name=product.name,
                 quantity=cart_item.quantity,
                 price=product.price,
-            )
+            ))
             product.stock_quantity -= cart_item.quantity
-            product.save(update_fields=['stock_quantity'])
+            products_to_update.append(product)
 
-        order.recalculate_total()
+        # Было: по одному INSERT OrderItem + UPDATE Tobacco на каждую позицию.
+        # Теперь независимо от размера корзины это два bulk-запроса.
+        OrderItem.objects.bulk_create(order_items)
+        Tobacco.objects.bulk_update(products_to_update, ['stock_quantity'])
+
+        # Все цены уже известны в памяти — не нужен дополнительный SELECT по
+        # order.items только ради суммы.
+        order.total_price = sum((item.price * item.quantity for item in order_items), start=0)
+        order.save(update_fields=['total_price'])
+
         cart.items.all().delete()
         return order
