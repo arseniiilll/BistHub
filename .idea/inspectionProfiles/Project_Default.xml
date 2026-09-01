@@ -1,0 +1,33 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="LanguageDetectionInspection" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="psycopg2" />
+          <option value="tzdata" />
+          <option value="djangorestframework" />
+          <option value="django-cors-headers" />
+          <option value="djoser" />
+          <option value="djangorestframework-simplejwt" />
+          <option value="Pillow" />
+          <option value="python-decouple" />
+          <option value="psycopg" />
+          <option value="gunicorn" />
+          <option value="celery" />
+          <option value="redis" />
+          <option value="django-filter" />
+          <option value="django-extensions" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="google.*" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
