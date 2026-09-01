@@ -2,16 +2,16 @@
 import logging
 
 import stripe
-from rest_framework import mixins, viewsets, permissions, status
-from rest_framework.decorators import action
-from rest_framework.views import APIView
-from rest_framework.response import Response
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404, redirect
+from rest_framework import mixins, permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from .models import Payment
-from .serializers import PaymentSerializer, PaymentCreateSerializer
+from .serializers import PaymentCreateSerializer, PaymentSerializer
 from .services import PaymentService, WebhookService
 
 logger = logging.getLogger(__name__)
@@ -22,9 +22,8 @@ class PaymentViewSet(mixins.ListModelMixin,
                      mixins.RetrieveModelMixin,
                      mixins.CreateModelMixin,
                      viewsets.GenericViewSet):
-    """
-    Платежи пользователя. Создание инициирует Stripe Checkout Session.
-    """
+    """Платежи текущего пользователя и создание Stripe Checkout Session."""
+
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
@@ -38,14 +37,7 @@ class PaymentViewSet(mixins.ListModelMixin,
 
     @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def success(self, request, pk=None):
-        """
-        Stripe возвращает браузер сюда после успешного Checkout.
-
-        Webhook остаётся главным источником истины, но для UX мы дополнительно
-        синхронизируем Stripe Checkout Session прямо здесь. Поэтому к моменту
-        redirect на React заказ уже не остаётся визуально в PENDING, даже если
-        webhook пришёл на долю секунды позже.
-        """
+        """Synchronise a completed Stripe session, then return to React."""
         payment = get_object_or_404(
             Payment.objects.select_related('order'),
             pk=pk,
@@ -62,10 +54,8 @@ class PaymentViewSet(mixins.ListModelMixin,
                         locked_payment = (
                             Payment.objects
                             .select_for_update()
-                            .select_related('order')
                             .get(pk=payment.pk)
                         )
-
                         if locked_payment.status not in (
                             Payment.Status.SUCCEEDED,
                             Payment.Status.PARTIALLY_REFUNDED,
@@ -74,20 +64,11 @@ class PaymentViewSet(mixins.ListModelMixin,
                             payment_intent_id = getattr(session, 'payment_intent', None)
                             if payment_intent_id and not locked_payment.stripe_payment_intent_id:
                                 locked_payment.stripe_payment_intent_id = payment_intent_id
+                            # mark_as_succeeded() also advances a pending Order to processing.
                             locked_payment.mark_as_succeeded()
-
-                        order = (
-                            locked_payment.order.__class__.objects
-                            .select_for_update()
-                            .get(pk=locked_payment.order_id)
-                        )
-                        if order.status == order.StatusChoices.PENDING:
-                            order.status = order.StatusChoices.PROCESSING
-                            order.save(update_fields=['status', 'updated'])
-
             except stripe.error.StripeError:
-                # Не ломаем redirect пользователю, если Stripe API временно
-                # недоступен: webhook всё равно остаётся резервным механизмом.
+                # The webhook remains the source of truth; a temporary Stripe API
+                # failure must not strand the browser on the backend callback.
                 logger.exception(
                     'Could not synchronise Stripe session for payment %s on success redirect',
                     payment.id,
@@ -100,7 +81,7 @@ class PaymentViewSet(mixins.ListModelMixin,
 
     @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def cancel(self, request, pk=None):
-        """Return the browser to a dedicated React payment-cancel page."""
+        """Return the browser to the React payment-cancel page."""
         payment = get_object_or_404(
             Payment.objects.select_related('order').only('id', 'order_id'),
             pk=pk,
@@ -117,49 +98,51 @@ class PaymentViewSet(mixins.ListModelMixin,
 
         try:
             result = PaymentService.create_checkout_session(order, request)
-        except ValueError as e:
+        except ValueError as exc:
             logger.warning(
-                f"ValueError creating payment for order {order.id}: {str(e)}"
+                'ValueError creating payment for order %s: %s',
+                order.id,
+                exc,
             )
             return Response(
-                {'non_field_errors': [str(e)]},
-                status=status.HTTP_400_BAD_REQUEST
+                {'non_field_errors': [str(exc)]},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-        except IntegrityError as e:
+        except IntegrityError as exc:
             logger.error(
-                f"IntegrityError creating payment for order {order.id}: {str(e)}"
+                'IntegrityError creating payment for order %s: %s',
+                order.id,
+                exc,
             )
             return Response(
                 {'non_field_errors': [
                     'Ошибка при создании платежа. Пожалуйста, попробуйте ещё раз.'
                 ]},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
         except Exception:
-            logger.exception(
-                f"Unexpected error creating payment for order {order.id}"
-            )
+            logger.exception('Unexpected error creating payment for order %s', order.id)
             return Response(
                 {'non_field_errors': ['Внутренняя ошибка сервера. Попробуйте ещё раз позже.']},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         try:
-            payment = Payment.objects.get(id=result['payment_id'])
+            payment = Payment.objects.select_related('order').get(id=result['payment_id'])
         except Payment.DoesNotExist:
             logger.error(
-                f"Payment {result['payment_id']} created but not found afterwards"
+                'Payment %s created but not found afterwards',
+                result['payment_id'],
             )
             return Response(
                 {'non_field_errors': ['Ошибка при создании платежа. Пожалуйста, попробуйте ещё раз.']},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         output_serializer = PaymentSerializer(
             payment,
-            context=self.get_serializer_context()
+            context=self.get_serializer_context(),
         )
-
         return Response(
             {**output_serializer.data, 'checkout_url': result['checkout_url']},
             status=status.HTTP_201_CREATED,
@@ -167,7 +150,8 @@ class PaymentViewSet(mixins.ListModelMixin,
 
 
 class StripeWebhookView(APIView):
-    """Приём и обработка Stripe webhook events."""
+    """Receive verified Stripe webhook events."""
+
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
@@ -176,29 +160,34 @@ class StripeWebhookView(APIView):
         sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
 
         if not sig_header:
-            logger.warning("Webhook received without Stripe-Signature header")
+            logger.warning('Webhook received without Stripe-Signature header')
             return Response(
                 {'detail': 'Missing Stripe-Signature header.'},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
             event = WebhookService.verify_and_parse(payload, sig_header)
-        except ValueError as e:
-            logger.warning(f"Invalid Stripe webhook signature or payload: {str(e)}")
+        except ValueError as exc:
+            logger.warning('Invalid Stripe webhook signature or payload: %s', exc)
             return Response(
-                {'detail': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
+                {'detail': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
             WebhookService.process_event(event)
-        except Exception as e:
+        except Exception as exc:
             logger.exception(
-                "Failed to process Stripe webhook event %s (type: %s): %s",
+                'Failed to process Stripe webhook event %s (type: %s): %s',
                 getattr(event, 'id', None),
                 getattr(event, 'type', None),
-                str(e)
+                exc,
+            )
+            # Important: a 5xx tells Stripe delivery failed and should be retried.
+            return Response(
+                {'detail': 'Webhook processing failed.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         return Response(status=status.HTTP_200_OK)
