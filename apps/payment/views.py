@@ -5,7 +5,9 @@ from rest_framework import mixins, viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from django.conf import settings
 from django.db import IntegrityError
+from django.shortcuts import get_object_or_404, redirect
 
 from .models import Payment
 from .serializers import PaymentSerializer, PaymentCreateSerializer
@@ -43,30 +45,32 @@ class PaymentViewSet(mixins.ListModelMixin,
     def get_serializer_context(self):
         return {'request': self.request}
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def success(self, request, pk=None):
         """
-        Обработка успешной оплаты (redirect от Stripe).
+        Redirect после успешного Stripe Checkout.
 
-        ВАЖНО: Реальный статус платежа подтверждается только вебхуком
-        (checkout.session.completed), этот эндпоинт лишь показывает
-        пользователю текущее состояние Payment.
+        Этот URL открывает сам браузер после Stripe, поэтому JWT Authorization
+        header здесь отсутствует. Никаких данных о платеже endpoint не отдаёт:
+        он только находит связанный order_id и возвращает пользователя в React.
+        Фактический статус платежа по-прежнему подтверждается вебхуком Stripe.
         """
-        payment = self.get_object()
-        serializer = self.get_serializer(payment)
-        return Response(serializer.data)
+        payment = get_object_or_404(
+            Payment.objects.select_related('order').only('id', 'order_id'),
+            pk=pk,
+        )
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+        return redirect(f'{frontend_url}/orders/{payment.order_id}?payment=success')
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def cancel(self, request, pk=None):
-        """
-        Обработка отмены оплаты (redirect от Stripe).
-
-        ВАЖНО: Реальный статус платежа подтверждается только вебхуком,
-        этот эндпоинт лишь показывает пользователю текущее состояние Payment.
-        """
-        payment = self.get_object()
-        serializer = self.get_serializer(payment)
-        return Response(serializer.data)
+        """Redirect обратно в React, если пользователь отменил Stripe Checkout."""
+        payment = get_object_or_404(
+            Payment.objects.select_related('order').only('id', 'order_id'),
+            pk=pk,
+        )
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+        return redirect(f'{frontend_url}/orders/{payment.order_id}?payment=cancelled')
 
     def create(self, request, *args, **kwargs):
         """
