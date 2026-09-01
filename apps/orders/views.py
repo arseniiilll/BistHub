@@ -17,15 +17,6 @@ class OrderViewSet(mixins.ListModelMixin,
     MAX_BULK_DELETE_IDS = 200
 
     def get_queryset(self):
-        # Самовосстановление старых записей: до исправления payment flow
-        # успешный Payment мог сохраниться как succeeded, а связанный Order
-        # остаться pending.
-        Order.objects.filter(
-            user=self.request.user,
-            status=Order.StatusChoices.PENDING,
-            payments__status__in=['succeeded', 'partially_refunded', 'refunded'],
-        ).update(status=Order.StatusChoices.PROCESSING)
-
         return Order.objects.filter(
             user=self.request.user,
             hidden_from_history=False,
@@ -69,8 +60,6 @@ class OrderViewSet(mixins.ListModelMixin,
             )
 
         try:
-            # dict.fromkeys сохраняет порядок и убирает повторяющиеся id,
-            # чтобы не гонять лишнюю работу по одному заказу несколько раз.
             ids = list(dict.fromkeys(int(order_id) for order_id in ids))
         except (TypeError, ValueError):
             return Response(
