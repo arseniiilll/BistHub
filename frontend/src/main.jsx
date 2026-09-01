@@ -23,7 +23,21 @@ function AppProvider({children}){const [user,setUser]=useState(null),[cart,setCa
  const logout=async()=>{try{await api.logout()}catch{api.tokens.clear()}setUser(null);setCart(null)}
  return <AppContext.Provider value={{user,setUser,cart,refreshCart,auth,logout,ready}}>{children}</AppContext.Provider>}
 
-function AgeGate(){const [show,setShow]=useState(()=>localStorage.getItem('bisthub_age_ok')!=='1');if(!show)return null;const accept=()=>{localStorage.setItem('bisthub_age_ok','1');setShow(false)};return <div className="gate"><div className="gate-card"><div className="eyebrow">AGE RESTRICTED</div><h1>Are you 18 or older?</h1><p>BistHub sells age-restricted tobacco products. By entering, you confirm that you are of legal age.</p><button className="btn wide" onClick={accept}>Yes, I am 18+</button><button className="text-btn" onClick={()=>location.href='https://google.com'}>No, leave website</button><small>Nicotine is highly addictive. Tobacco use seriously damages health.</small></div></div>}
+function AgeGate(){
+ const [status,setStatus]=useState('pending')
+ useEffect(()=>{document.body.style.overflow=status==='accepted'?'':'hidden';return()=>{document.body.style.overflow=''}},[status])
+ if(status==='accepted') return null
+ return <div className="gate gate-dark"><div className="gate-card gate-card-dark">
+   {status==='pending'?<>
+     <h1>ARE YOU OVER 18?</h1>
+     <p>You must be at least 18 years old to access this website.</p>
+     <div className="gate-actions"><button className="gate-btn" onClick={()=>setStatus('accepted')}>YES</button><button className="gate-btn" onClick={()=>setStatus('denied')}>NO</button></div>
+   </>:<>
+     <h1>ACCESS DENIED</h1>
+     <p>You must be at least 18 years old to access this website.</p>
+   </>}
+ </div></div>
+}
 
 function Header(){const {user,cart}=useApp();const [open,setOpen]=useState(false);return <><div className="warning">18+ ONLY · TOBACCO PRODUCTS CONTAIN NICOTINE AND ARE ADDICTIVE</div><header><Link className="logo" to="/">BIST<span>HUB</span></Link><nav className={open?'open':''}><NavLink to="/shop">Shop</NavLink><NavLink to="/about">About</NavLink>{user&&<NavLink to="/orders">Orders</NavLink>}</nav><div className="header-actions"><Link to="/shop" aria-label="Search"><Search/></Link><Link to={user?'/account':'/login'} aria-label="Account"><User/></Link><Link className="cart-icon" to="/cart" aria-label="Cart"><ShoppingBag/><b>{cart?.total_items||0}</b></Link><button className="menu" onClick={()=>setOpen(!open)}>{open?<X/>:<Menu/>}</button></div></header></>}
 function Layout({children}){return <><Header/><main>{children}</main><footer><div className="logo">BIST<span>HUB</span></div><p>Premium selection. Responsible service. Adults only.</p><div><Link to="/shop">Shop</Link><Link to="/about">About</Link><Link to="/account">Account</Link></div><small>© 2026 BistHub. Tobacco products are intended only for adults 18+.</small></footer></>}
