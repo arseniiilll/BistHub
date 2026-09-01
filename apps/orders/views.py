@@ -1,3 +1,4 @@
+from django.utils import timezone
 from rest_framework import mixins, viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -13,6 +14,7 @@ class OrderViewSet(mixins.ListModelMixin,
                     viewsets.GenericViewSet):
     """Заказы пользователя: список, детали, создание и скрытие из истории."""
     permission_classes = [permissions.IsAuthenticated]
+    MAX_BULK_DELETE_IDS = 200
 
     def get_queryset(self):
         # Самовосстановление старых записей: до исправления payment flow
@@ -60,9 +62,16 @@ class OrderViewSet(mixins.ListModelMixin,
                 {'detail': 'Передайте непустой список ids.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if len(ids) > self.MAX_BULK_DELETE_IDS:
+            return Response(
+                {'detail': f'За один запрос можно скрыть не более {self.MAX_BULK_DELETE_IDS} заказов.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
-            ids = [int(order_id) for order_id in ids]
+            # dict.fromkeys сохраняет порядок и убирает повторяющиеся id,
+            # чтобы не гонять лишнюю работу по одному заказу несколько раз.
+            ids = list(dict.fromkeys(int(order_id) for order_id in ids))
         except (TypeError, ValueError):
             return Response(
                 {'detail': 'Все ids должны быть числами.'},
@@ -74,5 +83,8 @@ class OrderViewSet(mixins.ListModelMixin,
             id__in=ids,
             hidden_from_history=False,
         )
-        count = queryset.update(hidden_from_history=True)
+        count = queryset.update(
+            hidden_from_history=True,
+            updated=timezone.now(),
+        )
         return Response({'deleted': count}, status=status.HTTP_200_OK)
