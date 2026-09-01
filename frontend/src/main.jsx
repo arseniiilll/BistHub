@@ -6,7 +6,14 @@ import {api} from './api'
 import './styles.css'
 
 const AppContext=createContext(null); const useApp=()=>useContext(AppContext)
-const money=v=>`${Number(v||0).toFixed(2)} MDL`
+const parseMoneyValue=v=>{
+  if(v===null||v===undefined||v==='') return 0
+  if(typeof v==='number') return Number.isFinite(v)?v:0
+  const cleaned=String(v).replace(/RON/gi,'').replace(/[^0-9,.-]/g,'').replace(',','.')
+  const num=Number(cleaned)
+  return Number.isFinite(num)?num:0
+}
+const money=v=>`${parseMoneyValue(v).toFixed(2).replace('.',',')} RON`
 const getResults=data=>Array.isArray(data)?data:(data?.results||[])
 
 function AppProvider({children}){const [user,setUser]=useState(null),[cart,setCart]=useState(null),[ready,setReady]=useState(false)
