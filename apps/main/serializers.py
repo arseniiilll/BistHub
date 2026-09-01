@@ -21,9 +21,6 @@ class ReviewSerializer(serializers.ModelSerializer):
 
 class ReviewCreateSerializer(serializers.ModelSerializer):
     """Автор проставляется из request.user, не принимается с клиента."""
-    # Без явного queryset PrimaryKeyRelatedField по умолчанию использует
-    # Tobacco.objects.all() — это позволило бы оставить отзыв на товар,
-    # скрытый/снятый с продажи и невидимый в публичном каталоге.
     tobacco = serializers.PrimaryKeyRelatedField(queryset=Tobacco.objects.filter(is_available=True))
 
     class Meta:
@@ -38,11 +35,6 @@ class ReviewCreateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         validated_data['author'] = self.context['request'].user
-        # validate() уже проверяет дубль, но это не защита от гонки: два
-        # параллельных запроса от одного автора на один товар оба могут
-        # пройти validate() до того, как любой из них сохранится. unique_together
-        # на модели тогда защитит данные, но без этого except второй запрос
-        # уронит необработанный IntegrityError (500) вместо аккуратного 400.
         try:
             return super().create(validated_data)
         except IntegrityError:
@@ -50,24 +42,27 @@ class ReviewCreateSerializer(serializers.ModelSerializer):
 
 
 class TobaccoListSerializer(serializers.ModelSerializer):
-    """Облегчённая версия для списков/каталога — без reviews и полного description."""
+    """Облегчённая версия для списков/каталога."""
     main_image = serializers.SerializerMethodField()
+    photo = serializers.ImageField(read_only=True)
     price = PriceField()
+
     class Meta:
         model = Tobacco
-        fields = ['id', 'name', 'slug', 'flavor', 'strength', 'price', 'is_available', 'main_image']
+        fields = ['id', 'name', 'slug', 'flavor', 'strength', 'price', 'is_available', 'main_image', 'photo']
 
     def get_main_image(self, obj):
-        # obj.images.filter(...) всегда бьёт в БД заново, игнорируя
-        # prefetch_related('images') из TobaccoViewSet.queryset — на списке
-        # из N товаров это N лишних запросов. obj.images.all() использует
-        # уже загруженный prefetch-кэш, дальше фильтруем в Python.
         images = list(obj.images.all())
-        if not images:
-            return None
-        main = next((img for img in images if img.is_main), images[0])
         request = self.context.get('request')
-        return request.build_absolute_uri(main.image.url) if request else main.image.url
+
+        if images:
+            main = next((img for img in images if img.is_main), images[0])
+            return request.build_absolute_uri(main.image.url) if request else main.image.url
+
+        if obj.photo:
+            return request.build_absolute_uri(obj.photo.url) if request else obj.photo.url
+
+        return None
 
 
 class TobaccoDetailSerializer(serializers.ModelSerializer):
@@ -76,6 +71,7 @@ class TobaccoDetailSerializer(serializers.ModelSerializer):
     reviews = ReviewSerializer(many=True, read_only=True)
     average_rating = serializers.SerializerMethodField()
     price = PriceField()
+
     class Meta:
         model = Tobacco
         fields = [

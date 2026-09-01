@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 import logging
 
+import stripe
 from rest_framework import mixins, viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from django.db import IntegrityError
+from django.conf import settings
+from django.db import IntegrityError, transaction
+from django.shortcuts import get_object_or_404, redirect
 
 from .models import Payment
 from .serializers import PaymentSerializer, PaymentCreateSerializer
 from .services import PaymentService, WebhookService
 
 logger = logging.getLogger(__name__)
+stripe.api_key = settings.STRIPE_SECRET_KEY
 
 
 class PaymentViewSet(mixins.ListModelMixin,
@@ -20,21 +24,10 @@ class PaymentViewSet(mixins.ListModelMixin,
                      viewsets.GenericViewSet):
     """
     Платежи пользователя. Создание инициирует Stripe Checkout Session.
-
-    Все финансовые операции выполняются только через PaymentService,
-    который использует select_for_update() для предотвращения race conditions.
-
-    Endpoints:
-    - GET /api/payments/ — список платежей текущего пользователя
-    - GET /api/payments/{id}/ — детали платежа
-    - POST /api/payments/ — инициировать новый платёж (создаёт Stripe Checkout Session)
-    - GET /api/payments/{id}/success/ — redirect URL после успешной оплаты
-    - GET /api/payments/{id}/cancel/ — redirect URL при отмене оплаты
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        """Платежи только текущего пользователя, с предзагруженным заказом."""
         return Payment.objects.filter(user=self.request.user).select_related('order')
 
     def get_serializer_class(self):
@@ -43,45 +36,81 @@ class PaymentViewSet(mixins.ListModelMixin,
     def get_serializer_context(self):
         return {'request': self.request}
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def success(self, request, pk=None):
         """
-        Обработка успешной оплаты (redirect от Stripe).
+        Stripe возвращает браузер сюда после успешного Checkout.
 
-        ВАЖНО: Реальный статус платежа подтверждается только вебхуком
-        (checkout.session.completed), этот эндпоинт лишь показывает
-        пользователю текущее состояние Payment.
+        Webhook остаётся главным источником истины, но для UX мы дополнительно
+        синхронизируем Stripe Checkout Session прямо здесь. Поэтому к моменту
+        redirect на React заказ уже не остаётся визуально в PENDING, даже если
+        webhook пришёл на долю секунды позже.
         """
-        payment = self.get_object()
-        serializer = self.get_serializer(payment)
-        return Response(serializer.data)
+        payment = get_object_or_404(
+            Payment.objects.select_related('order'),
+            pk=pk,
+        )
 
-    @action(detail=True, methods=['get'])
+        if payment.stripe_session_id:
+            try:
+                session = stripe.checkout.Session.retrieve(payment.stripe_session_id)
+                session_status = getattr(session, 'status', None)
+                payment_status = getattr(session, 'payment_status', None)
+
+                if session_status == 'complete' and payment_status == 'paid':
+                    with transaction.atomic():
+                        locked_payment = (
+                            Payment.objects
+                            .select_for_update()
+                            .select_related('order')
+                            .get(pk=payment.pk)
+                        )
+
+                        if locked_payment.status not in (
+                            Payment.Status.SUCCEEDED,
+                            Payment.Status.PARTIALLY_REFUNDED,
+                            Payment.Status.REFUNDED,
+                        ):
+                            payment_intent_id = getattr(session, 'payment_intent', None)
+                            if payment_intent_id and not locked_payment.stripe_payment_intent_id:
+                                locked_payment.stripe_payment_intent_id = payment_intent_id
+                            locked_payment.mark_as_succeeded()
+
+                        order = (
+                            locked_payment.order.__class__.objects
+                            .select_for_update()
+                            .get(pk=locked_payment.order_id)
+                        )
+                        if order.status == order.StatusChoices.PENDING:
+                            order.status = order.StatusChoices.PROCESSING
+                            order.save(update_fields=['status', 'updated'])
+
+            except stripe.error.StripeError:
+                # Не ломаем redirect пользователю, если Stripe API временно
+                # недоступен: webhook всё равно остаётся резервным механизмом.
+                logger.exception(
+                    'Could not synchronise Stripe session for payment %s on success redirect',
+                    payment.id,
+                )
+
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+        return redirect(
+            f'{frontend_url}/payment/success?payment_id={payment.id}&order_id={payment.order_id}'
+        )
+
+    @action(detail=True, methods=['get'], permission_classes=[permissions.AllowAny])
     def cancel(self, request, pk=None):
-        """
-        Обработка отмены оплаты (redirect от Stripe).
-
-        ВАЖНО: Реальный статус платежа подтверждается только вебхуком,
-        этот эндпоинт лишь показывает пользователю текущее состояние Payment.
-        """
-        payment = self.get_object()
-        serializer = self.get_serializer(payment)
-        return Response(serializer.data)
+        """Return the browser to a dedicated React payment-cancel page."""
+        payment = get_object_or_404(
+            Payment.objects.select_related('order').only('id', 'order_id'),
+            pk=pk,
+        )
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+        return redirect(
+            f'{frontend_url}/payment/cancel?payment_id={payment.id}&order_id={payment.order_id}'
+        )
 
     def create(self, request, *args, **kwargs):
-        """
-        Инициировать новый платёж.
-
-        Процесс:
-        1. Валидируем заказ через PaymentCreateSerializer
-        2. Вызываем PaymentService.create_checkout_session(order, request)
-        3. Возвращаем Payment + checkout_url для редиректа на оплату
-
-        Статус коды:
-        - 201 CREATED: платёж успешно инициирован
-        - 400 BAD REQUEST: ошибка валидации или бизнес-логики
-        - 500 INTERNAL SERVER ERROR: непредвиденная ошибка
-        """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         order = serializer.validated_data['order']
@@ -138,27 +167,11 @@ class PaymentViewSet(mixins.ListModelMixin,
 
 
 class StripeWebhookView(APIView):
-    """
-    Приём событий от Stripe. Проверяет подпись, сохраняет событие
-    (идемпотентно по event_id) и вызывает соответствующий обработчик.
-
-    АРХИТЕКТУРА ВЕБХУКОВ:
-    1. Stripe отправляет POST-запрос с подписью (HMAC-SHA256)
-    2. Мы проверяем подпись через WebhookService.verify_and_parse()
-    3. Сохраняем событие в БД (WebhookEvent) с статусом 'pending'
-    4. Обрабатываем событие через WebhookService.process_event()
-    5. Всегда возвращаем 200 OK (сигнализируем Stripe получение события)
-    """
+    """Приём и обработка Stripe webhook events."""
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        """
-        Обработать вебхук от Stripe.
-
-        Возвращает:
-            Response с статусом 200 (всегда) или 400 (только для неверной подписи)
-        """
         payload = request.body
         sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
 
