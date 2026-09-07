@@ -20,6 +20,7 @@ ENV/
 
 # Django
 *.log
+logs/
 *.pot
 *.mo
 db.sqlite3
