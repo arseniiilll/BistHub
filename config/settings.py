@@ -202,3 +202,95 @@ if not DEBUG:
 STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY', '')
 STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY', '')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET', '')
+
+# Logging
+LOG_DIR = BASE_DIR / 'logs'
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG' if DEBUG else 'INFO').upper()
+LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', str(5 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{asctime} | {levelname:<8} | {name} | {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '{levelname} | {name} | {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'level': LOG_LEVEL,
+            'formatter': 'simple',
+        },
+        'app_file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'level': 'INFO',
+            'filename': LOG_DIR / 'app.log',
+            'maxBytes': LOG_MAX_BYTES,
+            'backupCount': LOG_BACKUP_COUNT,
+            'formatter': 'verbose',
+            'encoding': 'utf-8',
+        },
+        'error_file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'level': 'ERROR',
+            'filename': LOG_DIR / 'errors.log',
+            'maxBytes': LOG_MAX_BYTES,
+            'backupCount': LOG_BACKUP_COUNT,
+            'formatter': 'verbose',
+            'encoding': 'utf-8',
+        },
+        'payment_file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'level': 'INFO',
+            'filename': LOG_DIR / 'payments.log',
+            'maxBytes': LOG_MAX_BYTES,
+            'backupCount': LOG_BACKUP_COUNT,
+            'formatter': 'verbose',
+            'encoding': 'utf-8',
+        },
+    },
+    'root': {
+        'handlers': ['console', 'app_file', 'error_file'],
+        'level': LOG_LEVEL,
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console', 'app_file', 'error_file'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'django.request': {
+            'handlers': ['console', 'error_file'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'apps.payment': {
+            'handlers': ['console', 'payment_file', 'error_file'],
+            'level': LOG_LEVEL,
+            'propagate': False,
+        },
+        'apps.orders': {
+            'handlers': ['console', 'app_file', 'error_file'],
+            'level': LOG_LEVEL,
+            'propagate': False,
+        },
+        'apps.cart': {
+            'handlers': ['console', 'app_file', 'error_file'],
+            'level': LOG_LEVEL,
+            'propagate': False,
+        },
+        'apps.accounts': {
+            'handlers': ['console', 'app_file', 'error_file'],
+            'level': LOG_LEVEL,
+            'propagate': False,
+        },
+    },
+}
